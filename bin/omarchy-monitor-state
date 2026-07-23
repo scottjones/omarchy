@@ -18,4 +18,8 @@ printf '%s\n' "$monitors_json" | jq -r '
 omarchy-hyprland-monitor-focused 2>/dev/null || echo
 omarchy-hyprland-monitor-scaling 2>/dev/null || echo
 
-printf '%s\n' "$monitors_json" | jq -c '[.[] | {name, enabled:(.disabled != true), focused:(.focused == true)}]'
+printf '%s\n' "$monitors_json" | jq -c '[.[] | {name, enabled:(.disabled != true), focused:(.focused == true), scale, width, height}]'
+
+# Hyprland-legal scale factors for the focused monitor (space-separated), so the
+# Display panel offers only scales this monitor can actually do.
+omarchy-hyprland-monitor-scaling list 2>/dev/null || echo

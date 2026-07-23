@@ -38,7 +38,11 @@ Panel {
   //                  j/k walks each row.
   // Mouse hover on a target updates root state via the components' `hovered`
   // signal so keyboard cursor and pointer share one highlight.
-  readonly property var scaleValues: ["1", "1.25", "1.6", "2", "3", "4"]
+  // Legal scales for the focused monitor (monitor-state line 8); fallback until loaded.
+  property var scaleValues: ["1", "1.25", "1.5", "2", "3", "4"]
+  // Monitor scaleValues was computed for; only refresh the pills when focus moves
+  // to a different monitor (the list is scale-invariant; avoids reconfigure jitter).
+  property string scaleListMonitor: ""
   property string focusSection: "scale"
   property int selectedIndex: 0
   property bool cursorActive: false
@@ -334,6 +338,7 @@ Panel {
   onBrightnessAvailableChanged: clampCursor()
   onDisplaysChanged: clampCursor()
   onVisibleSectionsChanged: clampCursor()
+  onScaleValuesChanged: clampCursor()
 
   // Only poll while the panel is open; the bar glyph tracks monitor count via
   // Quickshell.screens, and open-time refresh + Component.onCompleted cover the
@@ -360,8 +365,21 @@ Panel {
         root.internalEnabled = String(lines[3] || "").trim() !== ""
         root.mirrorEnabled = String(lines[4] || "").trim() === root.externalMonitor && root.externalMonitor !== ""
         root.focusedMonitor = String(lines[5] || "").trim()
-        root.monitorScale = root.normalizeScale(String(lines[6] || "").trim())
         root.updateDisplays(String(lines[7] || "[]").trim())
+        // Current scale = the focused monitor's raw value so the highlight matches
+        // the dynamic pills exactly; fall back to the legacy line 6 if absent.
+        var focusedScale = ""
+        for (var i = 0; i < root.displays.length; i++) {
+          if (root.displays[i] && root.displays[i].focused) { focusedScale = root.displays[i].scale; break }
+        }
+        root.monitorScale = root.normalizeScale(focusedScale !== "" ? focusedScale : String(lines[6] || "").trim())
+        // Legal scales (line 8); only refresh when focus moved to a new monitor
+        // (scale-invariant -- re-reading mid-reconfigure would flash a wrong list).
+        var scaleLine = String(lines[8] || "").trim()
+        if (scaleLine.length > 0 && root.focusedMonitor !== root.scaleListMonitor) {
+          root.scaleValues = scaleLine.split(/\s+/)
+          root.scaleListMonitor = root.focusedMonitor
+        }
       }
     }
   }
@@ -688,10 +706,31 @@ Panel {
             width: parent.width
             spacing: Style.space(10)
 
-            PanelSectionHeader {
-              text: "SCALE"
-              foreground: root.bar.foreground
-              fontFamily: root.bar.fontFamily
+            Item {
+              width: parent.width
+              implicitHeight: scaleHeader.implicitHeight
+
+              PanelSectionHeader {
+                id: scaleHeader
+                text: "SCALE"
+                foreground: root.bar.foreground
+                fontFamily: root.bar.fontFamily
+                anchors.left: parent.left
+                anchors.verticalCenter: parent.verticalCenter
+              }
+
+              // Which monitor the scale applies to (the focused one).
+              Text {
+                visible: root.focusedMonitor !== ""
+                text: root.focusedMonitor
+                color: Qt.darker(root.bar.foreground, 1.4)
+                font.family: root.bar.fontFamily
+                font.pixelSize: Style.font.caption
+                font.bold: true
+                anchors.right: parent.right
+                anchors.rightMargin: Style.space(6)
+                anchors.verticalCenter: parent.verticalCenter
+              }
             }
 
             Grid {
@@ -764,7 +803,7 @@ Panel {
     required property string scaleValue
     required property int scaleIndex
 
-    text: scaleValue + "x"
+    text: root.normalizeScale(scaleValue) + "x"
     fontSize: Style.font.caption
     foreground: root.bar.foreground
     fontFamily: root.bar.fontFamily

@@ -1,15 +1,15 @@
 #!/bin/bash
 
 # omarchy:summary=Show, set, or adjust focused Hyprland monitor scaling
-# omarchy:args=[up|down|1|1.25|1.6|2|3|4]
-# omarchy:examples=omarchy hyprland monitor scaling | omarchy hyprland monitor scaling 1.6 | omarchy hyprland monitor scaling up | omarchy hyprland monitor scaling down
+# omarchy:args=[list|up|down|1|1.25|1.6|2|3|4]
+# omarchy:examples=omarchy hyprland monitor scaling | omarchy hyprland monitor scaling list | omarchy hyprland monitor scaling 1.6 | omarchy hyprland monitor scaling up | omarchy hyprland monitor scaling down
 
 SCALES=(1 1.25 1.6 2 3 4)
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy"
 SCALE_LOG="$STATE_DIR/monitor-scaling.log"
 
 usage() {
-  echo "Usage: omarchy-hyprland-monitor-scaling [up|down|1|1.25|1.6|2|3|4]"
+  echo "Usage: omarchy-hyprland-monitor-scaling [list|up|down|1|1.25|1.6|2|3|4]"
 }
 
 focused_monitor_scale() {
@@ -68,6 +68,93 @@ clean_scale() {
     }'
 }
 
+# Scales the Display panel offers for a WIDTHxHEIGHT monitor: 1x + legal 2x/3x/4x
+# + ~1.25/1.5/1.75 snapped to the nearest legal value (0.12 gap, integers win).
+# A scale is legal when width/scale and height/scale are both whole pixels.
+legal_scales_for() {
+  awk -v width="$1" -v height="$2" '
+    function abs(x) { return x < 0 ? -x : x }
+    # Wayland steps scale in 1/120s, so scale*120 is a whole number; the scale is
+    # legal when that divides both width*120 and height*120 (whole logical pixels).
+    function legal(s,   k) { k = int(s * 120 + 0.5); return (width * 120) % k == 0 && (height * 120) % k == 0 }
+    # Nearest legal scale to x, scanning 1x..4x in 1/120 steps.
+    function snap(x,   k, s, best) {
+      best = 1
+      for (k = 120; k <= 480; k++) { s = k / 120; if (legal(s) && abs(s - x) < abs(best - x)) best = s }
+      return best
+    }
+    BEGIN {
+      # Always 1x; add 2x/3x/4x only when they are legal.
+      n = 0; keep[n++] = 1
+      if (legal(2)) keep[n++] = 2
+      if (legal(3)) keep[n++] = 3
+      if (legal(4)) keep[n++] = 4
+
+      # Snap fractional steps to the nearest legal scale; keep one only if it is
+      # >= 0.12 from every scale already chosen (no crowding, integers win).
+      split("1.25 1.5 1.75", want, " ")
+      for (i = 1; i <= 3; i++) {
+        s = snap(want[i]); ok = 1
+        for (j = 0; j < n; j++) if (abs(s - keep[j]) < 0.12) ok = 0
+        if (ok) keep[n++] = s
+      }
+
+      # Emit ascending.
+      for (a = 0; a < n; a++)
+        for (b = a + 1; b < n; b++)
+          if (keep[b] < keep[a]) { t = keep[a]; keep[a] = keep[b]; keep[b] = t }
+      out = ""
+      for (a = 0; a < n; a++) out = out (a ? " " : "") sprintf("%g", keep[a])
+      print out
+    }'
+}
+
+list_scales() {
+  local monitor_info width height
+  monitor_info="$(hyprctl monitors -j | jq -e -c '.[] | select(.focused == true)')" || return 1
+  width="$(echo "$monitor_info" | jq -r '.width')"
+  height="$(echo "$monitor_info" | jq -r '.height')"
+  legal_scales_for "$width" "$height"
+}
+
+# hl.monitor() statements (for `hyprctl eval`) that scale the focused monitor ($1)
+# to $2 and keep the rest flush: it stays put, right-neighbours shift by its
+# logical-width change, below-neighbours by its logical-height change. Logical
+# sizes use the 1/120 grid (px*120/round(scale*120)) to match Hyprland exactly.
+# If the layout would overlap (over-constrained 2D), emit nothing so set_scale
+# falls back to position="auto".
+build_layout_batch() {
+  local focus="$1" new_scale="$2"
+  hyprctl monitors -j | jq -r --arg focus "$focus" --arg ns "$new_scale" '
+    def logical($px; $s): ($px * 120 / (($s * 120) | round)) | round;
+    ([ .[] | select(.disabled != true) ]) as $ms
+    | ($ms[] | select(.name == $focus)) as $f
+    | ($ns | tonumber) as $s2
+    | logical($f.width;  $f.scale) as $ow
+    | logical($f.height; $f.scale) as $oh
+    | (logical($f.width;  $s2) - $ow) as $dx
+    | (logical($f.height; $s2) - $oh) as $dy
+    | ($f.x + $ow) as $fright
+    | ($f.y + $oh) as $fbottom
+    | [ $ms[]
+        | (if .name == $focus then $s2 else .scale end) as $s
+        | (if .name == $focus then .x elif (.x >= $fright) then (.x + $dx) else .x end) as $x
+        | (if .name == $focus then .y elif (.y >= $fbottom) then (.y + $dy) else .y end) as $y
+        | { name: .name, x: $x, y: $y, s: $s, w: .width, h: .height, rr: .refreshRate,
+            tf: (.transform // 0), lw: logical(.width; $s), lh: logical(.height; $s) }
+      ] as $r
+    | ( [ range(0; ($r | length)) as $i | range($i + 1; ($r | length)) as $j
+          | (([$r[$i].x + $r[$i].lw, $r[$j].x + $r[$j].lw] | min) - ([$r[$i].x, $r[$j].x] | max)) as $ox
+          | (([$r[$i].y + $r[$i].lh, $r[$j].y + $r[$j].lh] | min) - ([$r[$i].y, $r[$j].y] | max)) as $oy
+          | select($ox > 0 and $oy > 0) ] | length ) as $overlaps
+    | if $overlaps > 0 then ""
+      else [ $r[]
+             | "hl.monitor({ output = \"\(.name)\", mode = \"\(.w)x\(.h)@\(.rr)\", position = \"\(.x)x\(.y)\", scale = \(.s)\(if .tf != 0 then ", transform = \(.tf)" else "" end) })" ]
+           | join("\n")
+      end
+  '
+}
+
 set_scale() {
   local requested_scale="$1"
   local requested="${2:-$requested_scale}"
@@ -79,22 +166,32 @@ set_scale() {
   local refresh_rate="$(echo "$monitor_info" | jq -r '.refreshRate')"
   local new_scale="$(clean_scale "$requested_scale" "$width" "$height")"
   local monitor_lua="$HOME/.config/hypr/monitors.lua"
+  local enabled_count="$(hyprctl monitors -j | jq '[.[] | select(.disabled != true)] | length')"
 
-  hyprctl eval "hl.monitor({ output = \"$active_monitor\", mode = \"${width}x${height}@${refresh_rate}\", position = \"auto\", scale = $new_scale })" >/dev/null
+  # Apply the flush layout in one eval; empty batch -> position="auto" fallback.
+  local batch
+  batch="$(build_layout_batch "$active_monitor" "$new_scale")"
+  if [[ -n $batch ]]; then
+    hyprctl eval "$batch" >/dev/null
+  else
+    hyprctl eval "hl.monitor({ output = \"$active_monitor\", mode = \"${width}x${height}@${refresh_rate}\", position = \"auto\", scale = $new_scale })" >/dev/null
+  fi
   audit_scale_change "$requested" "$active_monitor" "$current_scale" "$new_scale"
 
-  # Persist to monitors.lua if the user still has Omarchy's generic catch-all
-  # defaults, so the scale survives reboots.
-  if [[ -f $monitor_lua ]] && grep -q '^local omarchy_monitor_scale = ' "$monitor_lua"; then
-    sed -i -E \
-      -e "s|^local omarchy_monitor_scale = .*|local omarchy_monitor_scale = ${new_scale}|" \
-      -e "s|^local omarchy_gdk_scale = .*|local omarchy_gdk_scale = ${new_scale}|" \
-      "$monitor_lua"
-  elif [[ -f $monitor_lua ]] && grep -Eq '^hl\.monitor\(\{ output = "", mode = "preferred", position = "auto", scale = ("auto"|[0-9.]+) \}\)' "$monitor_lua"; then
-    sed -i -E \
-      -e "s|^(hl\.monitor\(\{ output = \"\", mode = \"preferred\", position = \"auto\", scale = )([^ ]+)( \}\))|\\1${new_scale}\\3|" \
-      -e 's|^hl\.env\("GDK_SCALE", ".*"\)|hl.env("GDK_SCALE", "'"$new_scale"'")|' \
-      "$monitor_lua"
+  # Persist only for a single monitor: the stock persist is one uniform scale, so
+  # with 2+ monitors it would clobber the per-monitor scale (runtime-only there).
+  if (( enabled_count <= 1 )); then
+    if [[ -f $monitor_lua ]] && grep -q '^local omarchy_monitor_scale = ' "$monitor_lua"; then
+      sed -i -E \
+        -e "s|^local omarchy_monitor_scale = .*|local omarchy_monitor_scale = ${new_scale}|" \
+        -e "s|^local omarchy_gdk_scale = .*|local omarchy_gdk_scale = ${new_scale}|" \
+        "$monitor_lua"
+    elif [[ -f $monitor_lua ]] && grep -Eq '^hl\.monitor\(\{ output = "", mode = "preferred", position = "auto", scale = ("auto"|[0-9.]+) \}\)' "$monitor_lua"; then
+      sed -i -E \
+        -e "s|^(hl\.monitor\(\{ output = \"\", mode = \"preferred\", position = \"auto\", scale = )([^ ]+)( \}\))|\\1${new_scale}\\3|" \
+        -e 's|^hl\.env\("GDK_SCALE", ".*"\)|hl.env("GDK_SCALE", "'"$new_scale"'")|' \
+        "$monitor_lua"
+    fi
   fi
 }
 
@@ -132,6 +229,9 @@ case "${1:-}" in
 "")
   focused_monitor_scale | scale_from_current
   ;;
+list)
+  list_scales
+  ;;
 -h | --help)
   usage
   ;;
@@ -141,11 +241,15 @@ up)
 down)
   set_scale "$(focused_monitor_scale | scale_from_current previous)" "down"
   ;;
-1 | 1.25 | 1.6 | 2 | 3 | 4)
-  set_scale "$1" "$1"
-  ;;
 *)
-  usage >&2
-  exit 1
+  # Accept any positive number; clean_scale snaps it to the nearest scale this
+  # monitor can actually do, so the Display menu can pass computed values like
+  # 1.5 or 1.66667 (not just the legacy 1/1.25/1.6/2/3/4 presets).
+  if [[ $1 =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+    set_scale "$1" "$1"
+  else
+    usage >&2
+    exit 1
+  fi
   ;;
 esac
