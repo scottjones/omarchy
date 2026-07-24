@@ -71,6 +71,56 @@ normalize_scale() {
   awk 'NR == 1 { printf "%g\n", $0 }'
 }
 
+# Emits hl.monitor() statements (for `hyprctl eval`) that rescale the focused
+# monitor and keep the others flush: the focused monitor stays put, monitors to
+# its right shift by its logical-width change, monitors below by its logical-
+# height change. If no shift keeps them flush (they would overlap), emit nothing
+# so set_scale falls back to position="auto".
+build_layout_batch() {
+  local focus="$1" new_scale="$2"
+  hyprctl monitors -j | jq -r --arg focus "$focus" --arg new_scale "$new_scale" '
+    # Logical size = pixels / scale, snapped to the 1/120 pixel grid Hyprland uses.
+    def logical_size($pixels; $scale): ($pixels * 120 / (($scale * 120) | round)) | round;
+
+    # Do two placed monitors overlap? (touching edges do not count)
+    def overlaps($a; $b):
+      ([$a.x + $a.logical_w, $b.x + $b.logical_w] | min) > ([$a.x, $b.x] | max) and
+      ([$a.y + $a.logical_h, $b.y + $b.logical_h] | min) > ([$a.y, $b.y] | max);
+
+    [ .[] | select(.disabled != true) ] as $monitors
+    | ($monitors[] | select(.name == $focus)) as $focused
+    | ($new_scale | tonumber) as $target_scale
+
+    # How much the focused monitor grows/shrinks, and where its old right and
+    # bottom edges were (only monitors past those edges need to move).
+    | logical_size($focused.width;  $focused.scale) as $old_w
+    | logical_size($focused.height; $focused.scale) as $old_h
+    | (logical_size($focused.width;  $target_scale) - $old_w) as $shift_x
+    | (logical_size($focused.height; $target_scale) - $old_h) as $shift_y
+    | ($focused.x + $old_w) as $focused_right
+    | ($focused.y + $old_h) as $focused_bottom
+
+    # Re-place every monitor around the focused one.
+    | [ $monitors[]
+        | (if .name == $focus then $target_scale else .scale end) as $scale
+        | { name, refresh: .refreshRate, transform: (.transform // 0),
+            mode_w: .width, mode_h: .height, scale: $scale,
+            logical_w: logical_size(.width;  $scale),
+            logical_h: logical_size(.height; $scale),
+            x: (if .name == $focus then .x elif .x >= $focused_right  then .x + $shift_x else .x end),
+            y: (if .name == $focus then .y elif .y >= $focused_bottom then .y + $shift_y else .y end) }
+      ] as $layout
+
+    | if [ range(0; $layout|length) as $i | range($i+1; $layout|length) as $j
+           | overlaps($layout[$i]; $layout[$j]) ] | any
+      then ""
+      else $layout
+           | map("hl.monitor({ output = \"\(.name)\", mode = \"\(.mode_w)x\(.mode_h)@\(.refresh)\", position = \"\(.x)x\(.y)\", scale = \(.scale)\(if .transform != 0 then ", transform = \(.transform)" else "" end) })")
+           | join("\n")
+      end
+  '
+}
+
 set_scale() {
   local requested_scale="$1"
   local requested="${2:-$requested_scale}"
@@ -83,7 +133,17 @@ set_scale() {
   local new_scale="$(clean_scale "$requested_scale" "$width" "$height")"
   local monitor_lua="$HOME/.config/hypr/monitors.lua"
 
-  hyprctl eval "hl.monitor({ output = \"$active_monitor\", mode = \"${width}x${height}@${refresh_rate}\", position = \"auto\", scale = $new_scale })" >/dev/null
+  # Re-lay out all enabled monitors flush, focused one at the new scale (see
+  # build_layout_batch), so a scale change keeps displays in place instead of
+  # letting position="auto" reorder them. Fall back to auto if no flush layout
+  # exists (over-constrained 2D arrangement).
+  local batch
+  batch="$(build_layout_batch "$active_monitor" "$new_scale")"
+  if [[ -n $batch ]]; then
+    hyprctl eval "$batch" >/dev/null
+  else
+    hyprctl eval "hl.monitor({ output = \"$active_monitor\", mode = \"${width}x${height}@${refresh_rate}\", position = \"auto\", scale = $new_scale })" >/dev/null
+  fi
   audit_scale_change "$requested" "$active_monitor" "$current_scale" "$new_scale"
 
   # Persist to monitors.lua if the user still has Omarchy's generic catch-all
