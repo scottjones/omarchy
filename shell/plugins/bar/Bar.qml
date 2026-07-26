@@ -35,6 +35,7 @@ Item {
   property var fallbackBarConfig: ({
     position: "top",
     transparent: false,
+    floatingGap: 10,
     centerAnchor: "omarchy.clock",
     layout: { left: [], center: [], right: [] }
   })
@@ -291,9 +292,23 @@ Item {
 
   readonly property bool vertical: position === "left" || position === "right"
   readonly property int barSize: vertical ? Style.bar.sizeVertical : Style.bar.sizeHorizontal
+  // The gap the bar keeps beneath itself when opaque; it collapses to 0 when
+  // transparent so windows sit flush under the bar. The bar reserves this space
+  // itself (see BarPanel.exclusiveZone), so the top window inset lives in one
+  // place instead of being split with Hyprland's gaps_out. Set from shell.json
+  // (bar.floatingGap) via applyBarConfig; defaults to match the side gaps.
+  property int floatingGap: 10
 
   function normalizePosition(value) {
     return BarModel.normalizePosition(value)
+  }
+
+  // The floating gap the bar reserves beneath itself when opaque. Falls back to
+  // the default for anything that isn't a non-negative number.
+  function normalizeFloatingGap(value) {
+    return typeof value === "number" && isFinite(value) && value >= 0
+      ? Math.round(value)
+      : fallbackBarConfig.floatingGap
   }
 
   // Apply tray-pinning on top of the shared layout normalization so the
@@ -320,6 +335,7 @@ Item {
 
     position = normalizePosition(config.position)
     setRequestedTransparency(config.transparent === true)
+    floatingGap = normalizeFloatingGap(config.floatingGap)
     centerAnchor = Util.canonicalWidgetId(config.centerAnchor || "")
     layoutConfig = normalizeLayout(config.layout)
     barConfigSerial++
@@ -885,6 +901,13 @@ Item {
     implicitHeight: root.vertical ? 0 : root.barSize
     color: root.transparent ? "transparent" : root.background
     surfaceFormat.opaque: false
+    // Reserve the bar's own thickness plus its floating gap, so windows tile
+    // below both. A transparent bar drops the gap (flush); an opaque one keeps
+    // it. The zone never dips below barSize, so the drawn bar never overlaps a
+    // window. Keyed to requestedTransparent (the user's intent) rather than the
+    // rendered `transparent`, which lags behind a wallpaper-sampling step.
+    exclusionMode: ExclusionMode.Normal
+    exclusiveZone: root.requestedTransparent ? root.barSize : root.barSize + root.floatingGap
     WlrLayershell.namespace: "omarchy-bar"
     WlrLayershell.layer: WlrLayer.Top
 

@@ -6,7 +6,10 @@ local inactive_border_color = "rgba(595959aa)"
 hl.config({
   general = {
     gaps_in = 5,
-    gaps_out = 10,
+    -- The bar reserves its own floating gap (bar.floatingGap in shell.json) and
+    -- collapses it when the bar is transparent, so the top window gap is owned by
+    -- the bar, not here. gaps_out.top stays 0 to avoid double-counting it.
+    gaps_out = { top = 0, right = 10, bottom = 10, left = 10 },
     border_size = 2,
 
     col = {
