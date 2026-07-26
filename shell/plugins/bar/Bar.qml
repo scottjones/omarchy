@@ -333,12 +333,23 @@ Item {
   function applyBarConfig() {
     var config = Util.isPlainObject(barConfig) ? barConfig : fallbackBarConfig
 
+    var previousPosition = position
     position = normalizePosition(config.position)
     setRequestedTransparency(config.transparent === true)
     floatingGap = normalizeFloatingGap(config.floatingGap)
     centerAnchor = Util.canonicalWidgetId(config.centerAnchor || "")
     layoutConfig = normalizeLayout(config.layout)
     barConfigSerial++
+
+    if (position !== previousPosition) notifyBarOrientation()
+  }
+
+  // Announce which edge the bar now occupies so Hyprland can keep the window gap
+  // under the bar at 0 (the bar reserves that space itself via its exclusive
+  // zone) while the other three sides keep the standard gap. Uses the same hook
+  // contract as theme changes; fires only when the bar actually changes edges.
+  function notifyBarOrientation() {
+    Util.execDetached("omarchy-hook bar-orientation " + position)
   }
 
   onBarConfigChanged: applyBarConfig()
