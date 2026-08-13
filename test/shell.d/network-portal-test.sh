@@ -128,6 +128,21 @@ assert(
   /Quickshell\.execDetached\(\["omarchy-network-portal", "--open"\]\)/.test(panelSource),
   'network opens the portal through the command rather than building a URL itself'
 )
+
+// First run happens once per user, so the update prompt behind a portal has to
+// be deferred rather than dropped -- an early return costs that user the prompt
+// permanently, even after they sign in.
+const firstRunWifi = fs.readFileSync(root + '/install/user/first-run/wifi.sh', 'utf8')
+const announce = firstRunWifi.match(/announce_network\(\) \{[\s\S]*?\n\}/)
+assert(announce, 'first-run wifi has an announce_network function')
+assert(
+  /while omarchy-network-portal --check; do/.test(announce[0]),
+  'first run waits out a captive portal instead of abandoning the update prompt'
+)
+assert(
+  /notify_update/.test(announce[0].split('while omarchy-network-portal --check; do')[1] || ''),
+  'first run still reaches the update prompt once the portal clears'
+)
 JS
 
 # The command talks to nmcli, busctl and curl, so the stubs below stand in for
