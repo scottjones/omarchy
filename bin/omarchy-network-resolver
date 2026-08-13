@@ -1,0 +1,245 @@
+#!/bin/bash
+
+# omarchy:summary=Detect a network whose DNS server does not answer
+# omarchy:group=network
+# omarchy:args=[--check|--fix|--watch]
+# omarchy:examples=omarchy network resolver | omarchy network resolver --fix
+
+set -uo pipefail
+
+# nf-md-dns, escaped so this file reads without a Nerd Font.
+readonly RESOLVER_GLYPH=$'\U000f1c1c'
+
+# Public resolvers --fix pins the connection to. Two providers so one being
+# blocked on a hostile network still leaves a working answer.
+readonly PUBLIC_RESOLVERS=${OMARCHY_PUBLIC_RESOLVERS:-"1.1.1.1 9.9.9.9"}
+
+# A resolver that has not answered in this long is not going to.
+readonly QUERY_TIMEOUT=${OMARCHY_RESOLVER_TIMEOUT_SECONDS:-3}
+
+# Reached without DNS, so it can prove the link itself carries traffic. Answers
+# 301 over plain HTTPS on its own address.
+readonly REACHABILITY_URL="https://1.1.1.1"
+
+readonly WATCH_DEBOUNCE=${OMARCHY_RESOLVER_DEBOUNCE_SECONDS:-2}
+readonly WATCH_TICK=${OMARCHY_RESOLVER_TICK_SECONDS:-5}
+
+readonly announced_state=${OMARCHY_RESOLVER_STATE_FILE:-${XDG_RUNTIME_DIR:-/tmp}/omarchy/network-resolver-announced}
+
+dead_device=""
+dead_label=""
+dead_profile=""
+dead_servers=""
+last_checked=0
+
+nm_get() {
+  LC_ALL=C nmcli -e no -g "$@" 2>/dev/null
+}
+
+# The device owning the default route is the one whose resolvers everything
+# depends on. Wi-Fi and ethernet only: a tunnel's resolver is domain-scoped and
+# is not what a broken link looks like.
+default_route_device() {
+  local device
+  device=$(ip route show default 2>/dev/null | awk '/dev/ { for (i = 1; i < NF; i++) if ($i == "dev") { print $(i+1); exit } }')
+  [[ -n $device ]] || return 1
+
+  local type
+  type=$(nm_get GENERAL.TYPE device show "$device")
+  [[ $type == "wifi" || $type == "ethernet" ]] || return 1
+
+  printf '%s\n' "$device"
+}
+
+resolvers_for() {
+  nm_get IP4.DNS device show "$1" | tr '|' ' ' | tr -s ' '
+}
+
+# A real query rather than a port check: the failure this exists to catch is a
+# resolver that accepts packets and never replies.
+resolver_answers() {
+  local server=$1
+
+  OMARCHY_DNS_SERVER=$server OMARCHY_DNS_TIMEOUT=$QUERY_TIMEOUT python3 - <<'PY'
+import os, random, socket, struct, sys
+
+server = os.environ["OMARCHY_DNS_SERVER"]
+timeout = float(os.environ["OMARCHY_DNS_TIMEOUT"])
+
+query = struct.pack(">HHHHHH", random.randint(0, 65535), 0x0100, 1, 0, 0, 0)
+for label in b"cloudflare.com".split(b"."):
+    query += bytes([len(label)]) + label
+query += b"\x00" + struct.pack(">HH", 1, 1)
+
+probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+probe.settimeout(timeout)
+try:
+    probe.sendto(query, (server, 53))
+    probe.recvfrom(512)
+except Exception:
+    sys.exit(1)
+PY
+}
+
+link_carries_traffic() {
+  local device=$1
+
+  curl --interface "$device" --silent --output /dev/null \
+    --connect-timeout 2 --max-time 6 "$REACHABILITY_URL" 2>/dev/null
+}
+
+# Sets dead_* for a link whose every resolver is a black hole.
+#
+# A captive portal is deliberately excluded: before sign-in the gateway hijacks
+# DNS on purpose, and omarchy-network-portal is already asking the user to deal
+# with it. Two notifications for one network would be worse than one.
+find_dead_resolver() {
+  local device servers server
+
+  if command -v omarchy-network-portal >/dev/null && omarchy-network-portal --check >/dev/null 2>&1; then
+    return 1
+  fi
+
+  device=$(default_route_device) || return 1
+  servers=$(resolvers_for "$device")
+  [[ -n $servers ]] || return 1
+
+  for server in $servers; do
+    resolver_answers "$server" && return 1
+  done
+
+  # Nothing answered. Only a link that is otherwise fine has a resolver problem
+  # rather than an outage, and saying "DNS is broken" to someone whose Wi-Fi has
+  # simply dropped would send them the wrong way entirely.
+  link_carries_traffic "$device" || return 1
+
+  dead_device=$device
+  dead_servers=$servers
+  dead_profile=$(nm_get GENERAL.CONNECTION device show "$device")
+  dead_label=${dead_profile:-$device}
+}
+
+print_status() {
+  if ! find_dead_resolver; then
+    printf 'state\tok\n'
+    return 0
+  fi
+
+  printf 'state\tdead\n'
+  printf 'device\t%s\n' "$dead_device"
+  printf 'label\t%s\n' "$dead_label"
+  printf 'servers\t%s\n' "$dead_servers"
+}
+
+# Re-applies IP configuration the way that works without an interactive secret
+# agent. `nmcli connection up` prompts for the Wi-Fi passphrase and fails in a
+# non-interactive context; reapply needs an already-activated device; a device
+# bounce uses the stored secrets and always works.
+reapply_connection() {
+  local device=$1
+
+  nmcli device reapply "$device" >/dev/null 2>&1 && return 0
+
+  nmcli device disconnect "$device" >/dev/null 2>&1
+  nmcli device connect "$device" >/dev/null 2>&1
+}
+
+# Pins this one connection, never the machine. A global override would replace
+# the resolvers a corporate VPN or a home router hands out, breaking the split
+# horizon names those exist to serve.
+#
+# Deliberately not `resolvectl dns`: runtime overrides outrank NetworkManager
+# and survive until reverted, and a resolved that is busy timing out against the
+# dead server may not accept the revert.
+fix_resolver() {
+  find_dead_resolver || {
+    echo "No network with a failing DNS server detected." >&2
+    return 1
+  }
+
+  if [[ -z $dead_profile ]]; then
+    echo "Error: $dead_device has no connection profile to pin." >&2
+    return 1
+  fi
+
+  nmcli connection modify "$dead_profile" \
+    ipv4.dns "${PUBLIC_RESOLVERS// /,}" ipv4.ignore-auto-dns yes >/dev/null || return 1
+
+  reapply_connection "$dead_device"
+
+  printf 'Pinned %s to %s\n' "$dead_profile" "$PUBLIC_RESOLVERS"
+}
+
+read_announced() {
+  [[ -r $announced_state ]] && cat "$announced_state" 2>/dev/null
+}
+
+announce_dead_resolver() {
+  local now=$EPOCHSECONDS
+
+  ((now - last_checked < WATCH_DEBOUNCE)) && return 0
+  last_checked=$now
+
+  if ! find_dead_resolver; then
+    rm -f "$announced_state" 2>/dev/null || true
+    return 0
+  fi
+
+  [[ "$dead_device/$dead_label" == "$(read_announced)" ]] && return 0
+
+  omarchy-notification-wait || return 1
+
+  omarchy-notification-send \
+    --urgency critical \
+    --glyph "$RESOLVER_GLYPH" \
+    --exec "omarchy-network-resolver --fix" \
+    "No DNS on $dead_label" \
+    "This network's DNS server is not answering. Click to use public DNS." &&
+    {
+      mkdir -p "$(dirname "$announced_state")" 2>/dev/null || true
+      printf '%s\n' "$dead_device/$dead_label" >"$announced_state" 2>/dev/null || true
+    }
+}
+
+watch_resolvers() {
+  local status
+
+  announce_dead_resolver
+
+  nmcli monitor 2>/dev/null | while :; do
+    read -r -t "$WATCH_TICK" _
+    status=$?
+    ((status == 0 || status > 128)) || break
+    announce_dead_resolver
+  done
+}
+
+usage() {
+  echo "Usage: omarchy-network-resolver [--check|--fix|--watch]" >&2
+}
+
+if (($# == 0)); then
+  print_status
+  exit 0
+fi
+
+if (($# > 1)); then
+  usage
+  exit 1
+fi
+
+case "$1" in
+  --check)
+    find_dead_resolver
+    ;;
+  --fix)
+    fix_resolver
+    ;;
+  --watch)
+    watch_resolvers
+    ;;
+  *)
+    usage
+    exit 1
+    ;;
+esac
