@@ -31,6 +31,19 @@ Panel {
   // Live connection details from `ip` / /sys / iw.
   property var info: ({})  // { iface, type, ip, prefix, gateway, speed, duplex, ssid, signal, freq, bitrate, rx_bytes, tx_bytes, router_ping_ms, internet_ping_ms }
 
+  // A captive portal answers DHCP and leaves every reading above looking
+  // healthy, so nothing else the panel shows can give it away.
+  property bool portalDetected: false
+  property string portalDevice: ""
+  property string portalLabel: ""
+
+  // The hero describes whichever interface owns the default route, which need not
+  // be the intercepted one: a phone tether can carry the traffic while the Wi-Fi
+  // behind it is what is waiting to be signed in to. Naming the network then
+  // keeps the notice off the connection that is working fine.
+  readonly property bool portalIsElsewhere: portalDetected && portalDevice !== ""
+    && portalDevice !== (info.iface || "")
+
   // Throughput tracking. Rates are computed as deltas between successive
   // `omarchy-network-status --verbose` samples (~1.5s apart via detailsPoll).
   // We hold "prev" alongside a timestamp so the first sample after open or
@@ -130,10 +143,15 @@ Panel {
   // radio to switch. On a wired box it would otherwise sit there reading
   // "off" beside a perfectly live Ethernet connection.
   readonly property bool canToggleWifi: networkManagerAvailable && wifiStationAvailable
-  readonly property int qrHeaderIndex: canShareWifi ? 0 : -1
-  readonly property int speedHeaderIndex: canRunSpeedTest ? (canShareWifi ? 1 : 0) : -1
-  readonly property int toggleHeaderIndex: canToggleWifi ? (canShareWifi ? 1 : 0) + (canRunSpeedTest ? 1 : 0) : -1
-  readonly property int headerActionCount: (canShareWifi ? 1 : 0) + (canRunSpeedTest ? 1 : 0) + (canToggleWifi ? 1 : 0)
+  // Signing in leads the hero actions because nothing else in the panel works
+  // until it is done.
+  readonly property bool canSignInToPortal: portalDetected
+  readonly property int portalHeaderIndex: canSignInToPortal ? 0 : -1
+  readonly property int qrHeaderIndex: canShareWifi ? (canSignInToPortal ? 1 : 0) : -1
+  readonly property int speedHeaderIndex: canRunSpeedTest ? (canSignInToPortal ? 1 : 0) + (canShareWifi ? 1 : 0) : -1
+  readonly property int toggleHeaderIndex: canToggleWifi ? (canSignInToPortal ? 1 : 0) + (canShareWifi ? 1 : 0) + (canRunSpeedTest ? 1 : 0) : -1
+  readonly property int headerActionCount: (canSignInToPortal ? 1 : 0) + (canShareWifi ? 1 : 0) + (canRunSpeedTest ? 1 : 0) + (canToggleWifi ? 1 : 0)
+  readonly property bool portalHeaderHasCursor: cursorActive && focusSection === "header" && headerIndex === portalHeaderIndex
   readonly property bool qrHeaderHasCursor: cursorActive && focusSection === "header" && headerIndex === qrHeaderIndex
   readonly property bool speedHeaderHasCursor: cursorActive && focusSection === "header" && headerIndex === speedHeaderIndex
   readonly property bool toggleHeaderHasCursor: cursorActive && focusSection === "header" && headerIndex === toggleHeaderIndex
@@ -223,7 +241,8 @@ Panel {
   }
 
   function activateHeader() {
-    if (headerIndex === qrHeaderIndex) summonWifiQr()
+    if (headerIndex === portalHeaderIndex) signInToPortal()
+    else if (headerIndex === qrHeaderIndex) summonWifiQr()
     else if (headerIndex === speedHeaderIndex) summonSpeedTest()
     else if (headerIndex === toggleHeaderIndex) toggleNetwork()
   }
@@ -450,7 +469,7 @@ Panel {
     Quickshell.execDetached(["bash", "-c", "printf %s " + Util.shellQuote(value) + " | wl-copy"])
   }
 
-  readonly property string icon: Model.connectionIcon(kind, signalStrength)
+  readonly property string icon: Model.connectionIcon(kind, signalStrength, portalDetected)
 
   // The share card is its own panel plugin (omarchy.wifiqr) so a replacement
   // design can take it over; summon() routes to whichever implementation is
@@ -479,6 +498,7 @@ Panel {
       bandProc.command = ["omarchy-network-band"]
       bandProc.running = true
     }
+    pollPortal()
     // A closed panel has no nearby-network list to fill, and bare refresh()
     // reaches here from action completion, timeouts and construction.
     if (opened && wifiDevice) {
@@ -619,6 +639,24 @@ Panel {
   function updateDns(raw) {
     var value = String(raw || "").trim()
     dnsProvider = value || "DHCP"
+  }
+
+  function pollPortal() {
+    if (portalProc.running) return
+    portalProc.command = ["omarchy-network-portal"]
+    portalProc.running = true
+  }
+
+  function updatePortal(raw) {
+    var status = Model.parsePortalStatus(raw)
+
+    portalDetected = status.detected
+    portalDevice = status.device
+    portalLabel = status.label
+  }
+
+  function signInToPortal() {
+    Quickshell.execDetached(["omarchy-network-portal", "--open"])
   }
 
   function updateBand(raw) {
@@ -851,6 +889,27 @@ Panel {
     }
   }
 
+  Process {
+    id: portalProc
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: root.updatePortal(text)
+    }
+  }
+
+  // Unlike the other polls this one keeps running with the panel closed, because
+  // the bar icon is the whole point: a portal leaves the signal bars looking
+  // healthy, so without it the pill would claim the machine is online. Idle cost
+  // is one nmcli read a minute, and the command only probes once a device
+  // actually looks intercepted.
+  Timer {
+    id: portalPoll
+    interval: root.opened ? 4000 : 60000
+    repeat: true
+    running: true
+    onTriggered: root.pollPortal()
+  }
+
   // Slower than detailsPoll on purpose: this shells out to nmcli several times,
   // and band availability only moves when a scan turns up a new BSSID.
   Timer {
@@ -898,10 +957,14 @@ Panel {
     onTriggered: if (!detailsProc.running) detailsProc.running = true
   }
 
+  // Paused behind a portal: the meta line is carrying "SIGN-IN REQUIRED" then,
+  // and cycling idle chatter through it would blink the one message on the panel
+  // that has to stay put.
   Timer {
     id: connectionPhraseTimer
     interval: 2800
-    running: root.opened && (root.info.type === "ethernet" || (root.info.type === "wifi" && root.canDisconnect))
+    running: root.opened && !root.portalDetected
+      && (root.info.type === "ethernet" || (root.info.type === "wifi" && root.canDisconnect))
     repeat: true
     onTriggered: connectionPhraseSwap.restart()
   }
@@ -925,6 +988,15 @@ Panel {
     target: root
     function onInfoChanged() {
       if (!(root.info.type === "ethernet" || (root.info.type === "wifi" && root.canDisconnect))) {
+        connectionPhraseSwap.stop()
+        heroMeta.opacity = 1.0
+      }
+    }
+
+    // A portal can be spotted mid-fade, which would leave the sign-in notice
+    // stuck at whatever opacity the swap had reached.
+    function onPortalDetectedChanged() {
+      if (root.portalDetected) {
         connectionPhraseSwap.stop()
         heroMeta.opacity = 1.0
       }
@@ -1107,6 +1179,24 @@ Panel {
           anchors.right: parent.right
           anchors.verticalCenter: parent.verticalCenter
 
+          // Urgent-coloured because it is the one action on this panel that has
+          // to happen before anything else on the network will work.
+          Button {
+            id: portalAction
+            visible: root.canSignInToPortal
+            iconText: "󰖟"
+            tooltipText: root.portalLabel !== "" ? "Sign in to " + root.portalLabel : "Sign in to this network"
+            foreground: root.bar.urgent
+            fontFamily: root.bar.fontFamily
+            iconSize: Style.font.subtitle * 1.5
+            horizontalPadding: Style.space(5)
+            verticalPadding: Style.space(2)
+            hasCursor: root.portalHeaderHasCursor
+            Layout.alignment: Qt.AlignVCenter
+            onHovered: function(on) { if (on) root.setHeaderCursor(root.portalHeaderIndex) }
+            onClicked: root.signInToPortal()
+          }
+
           Button {
             id: qrAction
             visible: root.canShareWifi
@@ -1191,6 +1281,12 @@ Panel {
             id: heroMeta
             width: parent.width
             text: {
+              // Ahead of everything else: the link is up and the rows below all
+              // read normally, so this is the only line that explains why
+              // nothing works. Named when the portal is on another interface, so
+              // the notice never reads as being about the one carrying traffic.
+              if (root.portalIsElsewhere) return "SIGN-IN REQUIRED: " + root.portalLabel.toUpperCase()
+              if (root.portalDetected) return "SIGN-IN REQUIRED"
               if (root.info.type === "wifi") {
                 if (root.canDisconnect) return root.connectionPhrase.toUpperCase()
                 if (root.kind === "disconnected") return "NOT CONNECTED"
@@ -1201,7 +1297,7 @@ Panel {
               return ""
             }
             visible: text !== ""
-            color: Qt.darker(root.bar.foreground, 1.4)
+            color: root.portalDetected ? root.bar.urgent : Qt.darker(root.bar.foreground, 1.4)
             font.family: root.bar.fontFamily
             font.pixelSize: Style.font.caption
             font.bold: true

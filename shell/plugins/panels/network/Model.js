@@ -14,7 +14,10 @@ function wifiIconFor(strength) {
   return icons[index]
 }
 
-function connectionIcon(kind, signalStrength) {
+// nf-md-web when a captive portal is in the way: the link is fine and the signal
+// bars would say so, but nothing gets out until a browser has signed in.
+function connectionIcon(kind, signalStrength, portalDetected) {
+  if (portalDetected) return "󰖟"
   if (kind === "wifi") return wifiIconFor(signalStrength)
   if (kind === "ethernet") return "󰈀"
   return "󰤮"
@@ -85,6 +88,18 @@ function parseBandStatus(raw) {
     band: next.band || "",
     selected: next.selected || "auto",
     available: available
+  }
+}
+
+// `omarchy-network-portal` always reports a state, so an empty read means the
+// command has not answered yet rather than that the network is clear.
+function parsePortalStatus(raw) {
+  var next = parseKeyValue(raw)
+
+  return {
+    detected: next.state === "portal",
+    device: next.device || "",
+    label: next.label || ""
   }
 }
 
@@ -349,6 +364,7 @@ if (typeof module !== "undefined") {
     bandSectionTitle: bandSectionTitle,
     bandTooltip: bandTooltip,
     parseBandStatus: parseBandStatus,
+    parsePortalStatus: parsePortalStatus,
     decodeIwSsid: decodeIwSsid,
     parseKeyValue: parseKeyValue,
     throughputState: throughputState,
