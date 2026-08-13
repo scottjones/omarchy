@@ -42,8 +42,12 @@ reset_machine() {
 run_migration() {
   : >"$CALLS"
 
+  # The elevated call goes through $OMARCHY_PATH/bin rather than sudo's PATH, so
+  # point that at the stubs too — otherwise the migration reaches past them and
+  # drives the radio on the machine running the test.
   OMARCHY_BLUETOOTH_MIGRATION_MARKER="$marker" \
     OMARCHY_BLUETOOTH_MAIN_CONF="$main_conf" \
+    OMARCHY_PATH="$test_dir" \
     PATH="$test_dir/bin:$PATH" \
     bash -euo pipefail "$migration" >/dev/null
 }
@@ -81,10 +85,14 @@ grep -qx 'omarchy-bluetooth-power off' "$CALLS" ||
 pass "migration blocks when no adapter can be read"
 
 # /dev/rfkill is only writable unelevated from an active graphical seat, so an
-# update run over SSH would abort here and abort again on every retry.
-grep -qx 'sudo omarchy-bluetooth-power off' "$CALLS" ||
-  fail "migration changes the radio through sudo" "$(cat "$CALLS")"
-pass "migration changes the radio through sudo"
+# update run over SSH would abort here and abort again on every retry. By path,
+# because sudo resolves a bare name against secure_path, which a dev-linked
+# checkout only joins through the drop-in omarchy-dev-link writes: without the
+# path, this migration dies on a command not found and takes every migration
+# behind it with it.
+grep -qx "sudo $test_dir/bin/omarchy-bluetooth-power off" "$CALLS" ||
+  fail "migration changes the radio through sudo, by path" "$(cat "$CALLS")"
+pass "migration changes the radio through sudo, by path"
 
 # A second account must not undo an administrator's later choice, since migration
 # completion is recorded per user.

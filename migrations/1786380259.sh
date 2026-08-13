@@ -18,10 +18,16 @@ fi
 # sudo because this runs machine-wide and /dev/rfkill is only writable without it
 # from an active graphical seat — an update over SSH would otherwise abort here,
 # before the marker, and abort again on every retry.
+#
+# By path, because sudo resolves a bare name against secure_path and never the
+# caller's PATH: a checkout dev-linked before omarchy-dev-link started writing
+# its sudoers drop-in is invisible there, and the command not found that follows
+# stops every migration behind this one. $OMARCHY_PATH/bin holds the packaged
+# symlinks as well, so the path is right either way.
 if omarchy-bluetooth-power is-on; then
-  sudo omarchy-bluetooth-power on
+  sudo "$OMARCHY_PATH/bin/omarchy-bluetooth-power" on
 else
-  sudo omarchy-bluetooth-power off
+  sudo "$OMARCHY_PATH/bin/omarchy-bluetooth-power" off
 fi
 
 # Omarchy set AutoEnable=false believing bluetoothd would then restore the last
