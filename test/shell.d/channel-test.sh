@@ -87,6 +87,13 @@ case "${OMARCHY_TEST_PACKAGES:-}" in
 esac
 '
 
+# Channel switching is an x86 pacman.conf path. Stub the detector so this
+# file still exercises that path on Apple Silicon; the live refusal is
+# covered in apple-silicon-test.sh.
+write_stub omarchy-hw-apple-silicon '#!/bin/bash
+exit 1
+'
+
 run_channel() {
   : >"$log_file"
   OMARCHY_CHANNEL_TEST_LOG="$log_file" \
