@@ -91,3 +91,19 @@ chmod +x "$stub_bin/lspci" "$stub_bin/omarchy-pkg-add"
 OMARCHY_TEST_MUTATION_LOG="$mutation_log" PATH="$stub_bin:/usr/bin:/bin" bash "$ROOT/install/hardware/vulkan.sh"
 [[ $(cat "$mutation_log") == "vulkan-asahi" ]] || fail "Vulkan setup selects vulkan-asahi from the Apple Silicon detector" "$(cat "$mutation_log")"
 pass "Vulkan setup selects vulkan-asahi from the Apple Silicon detector"
+
+: >"$mutation_log"
+cat >"$stub_bin/uname" <<'EOF'
+#!/bin/bash
+printf '%s\n' "${OMARCHY_TEST_ARCH:-aarch64}"
+EOF
+chmod +x "$stub_bin/uname"
+OMARCHY_TEST_MUTATION_LOG="$mutation_log" PATH="$stub_bin:/usr/bin:/bin" bash "$ROOT/migrations/1788596255.sh"
+[[ ! -s $mutation_log ]] || fail "the vi migration does not call pkg-add on aarch64" "$(cat "$mutation_log")"
+pass "the vi migration is a no-op on aarch64"
+
+: >"$mutation_log"
+OMARCHY_TEST_ARCH=x86_64 OMARCHY_TEST_MUTATION_LOG="$mutation_log" PATH="$stub_bin:/usr/bin:/bin" \
+  bash "$ROOT/migrations/1788596255.sh"
+[[ $(cat "$mutation_log") == "vi" ]] || fail "the vi migration still installs vi on x86_64" "$(cat "$mutation_log")"
+pass "the vi migration still installs vi on x86_64"
