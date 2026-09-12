@@ -99,8 +99,8 @@ printf '%s\n' "${OMARCHY_TEST_ARCH:-aarch64}"
 EOF
 chmod +x "$stub_bin/uname"
 OMARCHY_TEST_MUTATION_LOG="$mutation_log" PATH="$stub_bin:/usr/bin:/bin" bash "$ROOT/migrations/1788596255.sh"
-[[ ! -s $mutation_log ]] || fail "the vi migration does not call pkg-add on aarch64" "$(cat "$mutation_log")"
-pass "the vi migration is a no-op on aarch64"
+[[ $(cat "$mutation_log") == "vi" ]] || fail "the vi migration installs vi on aarch64" "$(cat "$mutation_log")"
+pass "the vi migration installs vi on aarch64"
 
 : >"$mutation_log"
 OMARCHY_TEST_ARCH=x86_64 OMARCHY_TEST_MUTATION_LOG="$mutation_log" PATH="$stub_bin:/usr/bin:/bin" \
