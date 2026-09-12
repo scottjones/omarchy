@@ -18,6 +18,9 @@ mkinitcpio_conf_dir="${OMARCHY_MKINITCPIO_CONF_DIR:-/etc/mkinitcpio.conf.d}"
 # A drop-in that already names plymouth (the x86 omarchy_hooks.conf) means the
 # main file is left alone.
 effective_hooks=$(
+  # Drop-ins (including omarchy_hooks.conf) expand XKBLAYOUT from vconsole.conf,
+  # which often only sets KEYMAP. Migrations run with nounset.
+  set +u
   shopt -s nullglob
   HOOKS=()
   source "$mkinitcpio_conf"

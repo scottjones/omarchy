@@ -107,6 +107,26 @@ grep -qx 'HOOKS=(base udev autodetect modconf kms keyboard keymap consolefont bl
 grep -q '^grub-mkconfig' "$calls" || fail "GRUB is still configured when only the hook was already present"
 pass "an existing plymouth drop-in leaves mkinitcpio.conf alone"
 
+# vconsole.conf often has no XKBLAYOUT. A drop-in that expands it must not
+# abort the leaf under nounset (how omarchy-migrate sources it).
+new_fixture xkb-unset
+stock_asahi
+cat >"$fixture/etc/mkinitcpio.conf.d/omarchy_hooks.conf" <<'CONF'
+HOOKS=(base udev plymouth block filesystems)
+case $(echo "${XKBLAYOUT%%,*}") in
+  *) : ;;
+esac
+CONF
+PATH="$stub_bin:$PATH" OMARCHY_TEST_CALLS="$calls" STUB_LIMINE=0 \
+  OMARCHY_GRUB_DEFAULT="$fixture/etc/default/grub" \
+  OMARCHY_GRUB_CFG="$fixture/boot/grub/grub.cfg" \
+  OMARCHY_MKINITCPIO_CONF="$fixture/etc/mkinitcpio.conf" \
+  OMARCHY_MKINITCPIO_CONF_DIR="$fixture/etc/mkinitcpio.conf.d" \
+  bash -euo pipefail -c 'source "$1"' bash "$ROOT/install/login/grub-splash.sh"
+grep -qx 'GRUB_DISTRIBUTOR="Omarchy"' "$fixture/etc/default/grub" ||
+  fail "nounset XKBLAYOUT in a drop-in does not abort GRUB branding"
+pass "sourcing drop-ins survives an unset XKBLAYOUT"
+
 # GRUB file without a default command line: the line is added, not lost.
 new_fixture no-cmdline
 printf 'HOOKS=(base udev plymouth block filesystems)\n' >"$fixture/etc/mkinitcpio.conf"
